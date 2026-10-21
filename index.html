@@ -104,7 +104,7 @@
       <!-- 액션 버튼들 (팟캐스트, 뷰모드, 휴지통, 동기화) -->
       <div class="flex items-center gap-1.5 sm:gap-2">
         
-        <!-- 🎧 팟캐스트 연속 재생 버튼 (핵심 추가) -->
+        <!-- 🎧 팟캐스트 연속 재생 버튼 -->
         <button id="podcastToggleBtn" onclick="togglePodcastMode()" class="px-2.5 sm:px-3.5 py-1.5 sm:py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-xl font-bold shadow-lg shadow-purple-900/30 flex items-center gap-1.5 transition-all text-xs" title="남은 문제 연속 팟캐스트 재생 (단축키 P)">
           <span id="podcastBtnIcon">🎧</span>
           <span id="podcastBtnText" class="font-semibold">팟캐스트</span>
@@ -423,7 +423,7 @@
     </div>
   </div>
 
-  <!-- 토스트 알림 -->
+  <!-- 토스트 알림 (화면 흐름을 방해하지 않는 부드러운 알림) -->
   <div id="syncToast" class="fixed bottom-5 right-5 z-50 bg-slate-900 border border-emerald-500/50 text-white px-4 py-3 rounded-2xl shadow-2xl flex items-center gap-3 transition-all duration-300 transform opacity-0 -translate-y-4 pointer-events-none">
     <span class="text-emerald-400 text-lg">⚡</span>
     <span id="syncToastMsg" class="text-xs font-medium">동기화 완료</span>
@@ -449,7 +449,8 @@
       currentTab: 'solution',
       isAnswerRevealed: false,
       autoTts: false,
-      lastUpdatedAt: 0
+      lastUpdatedAt: 0,
+      hasUnsyncedChanges: false
     };
 
     // 팟캐스트 상태 객체
@@ -495,17 +496,36 @@
         mqttClient.on('message', (receivedTopic, message) => {
           try {
             const payload = JSON.parse(message.toString());
+            // 내가 보낸 메시지는 무시
             if (payload.senderId === DEVICE_ID) return;
 
+            // 실제 내용(삭제 ID, 즐겨찾기 ID)에 실질적인 변화가 있는지 엄격히 검사
+            const incomingDeleted = new Set(payload.deletedIds || []);
+            const incomingStarred = new Set(payload.starredIds || []);
+
+            const isSameDeleted = incomingDeleted.size === state.deletedIds.size &&
+              [...incomingDeleted].every(id => state.deletedIds.has(id));
+            const isSameStarred = incomingStarred.size === state.starredIds.size &&
+              [...incomingStarred].every(id => state.starredIds.has(id));
+
+            // 데이터에 실질적인 변경이 없으면 화면을 일절 건드리지 않고 타임스탬프만 기록
+            if (isSameDeleted && isSameStarred) {
+              if (payload.updatedAt > state.lastUpdatedAt) {
+                state.lastUpdatedAt = payload.updatedAt;
+              }
+              return;
+            }
+
             if (payload.updatedAt > state.lastUpdatedAt) {
-              console.log("Sync message received from another device:", payload);
-              state.deletedIds = new Set(payload.deletedIds || []);
-              state.starredIds = new Set(payload.starredIds || []);
+              console.log("Sync message received with actual changes:", payload);
+              state.deletedIds = incomingDeleted;
+              state.starredIds = incomingStarred;
               state.lastUpdatedAt = payload.updatedAt;
 
               saveLocalOnly();
-              updateActiveCards();
-              showSyncToast("⚡ 다른 기기에서 수정되어 실시간 동기화되었습니다!");
+              // [핵심 해결] 현재 풀고 있던 문제 ID와 정답 공개 상태를 100% 보존하면서 업데이트!
+              updateActiveCards(true);
+              showSyncToast("⚡ 다른 기기 학습 진행도가 동기화되었습니다 (현재 문제 유지)");
             }
           } catch (e) {
             console.error("Message parse error:", e);
@@ -528,16 +548,17 @@
         console.error("MQTT init failed:", e);
       }
 
-      // 10초 이내 동기화 보장을 위한 주기적 하트비트 핑 (10초 주기)
+      // 로컬에 미전송된 변경사항이 있을 때만 5초 주기로 안전 동기화 (불필요한 가짜 핑 발행 금지)
       setInterval(() => {
-        if (mqttClient && isConnected) {
+        if (mqttClient && isConnected && state.hasUnsyncedChanges) {
           publishState(false);
         }
-      }, 10000);
+      }, 5000);
     }
 
     function publishState(showToast = false) {
       state.lastUpdatedAt = Date.now();
+      state.hasUnsyncedChanges = false;
       saveLocalOnly();
 
       if (mqttClient && isConnected) {
@@ -590,12 +611,18 @@
     }
 
     function saveAndSync() {
+      state.hasUnsyncedChanges = true;
       saveLocalOnly();
       publishState(false);
     }
 
-    // 3. 필터링 및 카드 렌더링
-    function updateActiveCards() {
+    // 3. 필터링 및 카드 렌더링 (keepCurrentProblem: 현재 보고 있던 문제를 화면에 그대로 고정)
+    function updateActiveCards(keepCurrentProblem = false) {
+      const currentItem = state.activeCards[state.currentIndex];
+      const currentCardId = currentItem ? currentItem.id : null;
+      const wasAnswerRevealed = state.isAnswerRevealed;
+      const wasTab = state.currentTab;
+
       const q = state.searchKeyword.toLowerCase().trim();
       state.activeCards = ALL_PROBLEMS.filter(item => {
         // '남음' 카드만 표시 (외운/삭제된 카드 제외)
@@ -616,6 +643,24 @@
         return true;
       });
 
+      // [핵심] 다른 기기 동기화 시: 현재 보고 있던 카드가 여전히 남아있다면 그 문제를 100% 그대로 유지!
+      if (keepCurrentProblem && currentCardId !== null) {
+        const existingIdx = state.activeCards.findIndex(c => c.id === currentCardId);
+        if (existingIdx !== -1) {
+          state.currentIndex = existingIdx;
+          state.isAnswerRevealed = wasAnswerRevealed;
+          state.currentTab = wasTab;
+
+          // 문제 새로고침이나 정답 가림 없이 조용히 인덱스/배지만 갱신
+          renderCurrentCardPreserved(wasAnswerRevealed);
+          renderListView();
+          updateDashboardStats();
+          if (podcast.active) updatePodcastUI();
+          return;
+        }
+      }
+
+      // 현재 보던 문제가 다른 기기에서 삭제되었거나 직접 카테고리/검색을 바꾼 경우
       if (state.currentIndex >= state.activeCards.length) {
         state.currentIndex = Math.max(0, state.activeCards.length - 1);
       }
@@ -624,6 +669,46 @@
       renderListView();
       updateDashboardStats();
       if (podcast.active) updatePodcastUI();
+    }
+
+    // 화면 새로고침 없이 현재 보고 있던 문제와 정답 표시 상태를 완벽 유지하는 렌더러
+    function renderCurrentCardPreserved(keepAnswerRevealed) {
+      const totalCountSpan = document.getElementById('totalActiveCards');
+      const currentIndexSpan = document.getElementById('currentCardIndex');
+      
+      totalCountSpan.textContent = state.activeCards.length;
+
+      if (state.activeCards.length === 0) {
+        document.getElementById('cardQuestionText').textContent = "조건에 맞는 남은 문제가 없습니다. (휴지통에서 복구하거나 검색어를 지우세요)";
+        document.getElementById('showAnswerSection').classList.add('hidden');
+        document.getElementById('answerSection').classList.add('hidden');
+        currentIndexSpan.textContent = "#0";
+        return;
+      }
+
+      const item = state.activeCards[state.currentIndex];
+      currentIndexSpan.textContent = `#${state.currentIndex + 1}`;
+
+      // 즐겨찾기 별표 상태만 갱신
+      const starBtn = document.getElementById('starBtn');
+      if (state.starredIds.has(item.id)) {
+        starBtn.textContent = '★';
+        starBtn.className = 'p-1.5 text-amber-400 hover:text-amber-300 text-base font-bold';
+      } else {
+        starBtn.textContent = '☆';
+        starBtn.className = 'p-1.5 text-slate-500 hover:text-amber-400 text-base';
+      }
+
+      // 정답 노출 상태를 그대로 보존 (화면 깜빡임이나 재낭독 방지)
+      if (keepAnswerRevealed) {
+        state.isAnswerRevealed = true;
+        document.getElementById('showAnswerSection').classList.add('hidden');
+        document.getElementById('answerSection').classList.remove('hidden');
+      } else {
+        state.isAnswerRevealed = false;
+        document.getElementById('showAnswerSection').classList.remove('hidden');
+        document.getElementById('answerSection').classList.add('hidden');
+      }
     }
 
     function renderCurrentCard() {
@@ -758,7 +843,7 @@
       const item = state.activeCards[state.currentIndex];
       state.deletedIds.add(item.id);
       saveAndSync();
-      updateActiveCards();
+      updateActiveCards(false);
       showSyncToast("문제를 '외움' 처리하여 휴지통으로 이동했습니다.");
     }
 
@@ -768,7 +853,7 @@
       if (state.starredIds.has(item.id)) state.starredIds.delete(item.id);
       else state.starredIds.add(item.id);
       saveAndSync();
-      renderCurrentCard();
+      renderCurrentCardPreserved(state.isAnswerRevealed);
     }
 
     function updateDashboardStats() {
@@ -828,7 +913,7 @@
     function deleteCardById(id) {
       state.deletedIds.add(id);
       saveAndSync();
-      updateActiveCards();
+      updateActiveCards(true);
     }
 
     // 휴지통 모달
@@ -871,7 +956,7 @@
       state.deletedIds.delete(id);
       saveAndSync();
       openTrashModal();
-      updateActiveCards();
+      updateActiveCards(true);
       showSyncToast("문제를 성공적으로 원복했습니다!");
     }
 
@@ -880,7 +965,7 @@
         state.deletedIds.clear();
         saveAndSync();
         closeTrashModal();
-        updateActiveCards();
+        updateActiveCards(true);
         showSyncToast("모든 문제가 원복되었습니다!");
       }
     }
@@ -934,7 +1019,7 @@
         listContainer.classList.add('hidden');
         viewCardBtn.className = 'px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-lg font-medium transition-all bg-emerald-600 text-white shadow-sm flex items-center gap-1';
         viewListBtn.className = 'px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-lg font-medium text-slate-400 hover:text-slate-200 transition-all flex items-center gap-1';
-        renderCurrentCard();
+        renderCurrentCardPreserved(state.isAnswerRevealed);
       } else {
         cardContainer.classList.add('hidden');
         listContainer.classList.remove('hidden');
@@ -953,12 +1038,12 @@
           btn.className = 'cat-pill px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-lg font-medium transition-all bg-slate-800 text-slate-300 hover:bg-slate-700 shrink-0';
         }
       });
-      updateActiveCards();
+      updateActiveCards(false);
     }
 
     function onSearchChange() {
       state.searchKeyword = document.getElementById('searchInput').value;
-      updateActiveCards();
+      updateActiveCards(false);
     }
 
     // ========================================================
@@ -1219,7 +1304,7 @@
     // 앱 시작 시 로드 및 MQTT 연결
     window.addEventListener('DOMContentLoaded', () => {
       loadSavedState();
-      updateActiveCards();
+      updateActiveCards(false);
       initMqttSync();
     });
   </script>
