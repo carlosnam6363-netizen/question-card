@@ -500,6 +500,16 @@
       'wss://broker.emqx.io:8084/mqtt'
     ];
     let currentBrokerIdx = 0;
+    let failoverTimer = null;
+
+    function scheduleBrokerFailover() {
+      if (failoverTimer) return;
+      failoverTimer = setTimeout(() => {
+        failoverTimer = null;
+        currentBrokerIdx = (currentBrokerIdx + 1) % MQTT_BROKERS.length;
+        initMqttSync();
+      }, 3000);
+    }
 
     // 1. MQTT 실시간 동기화 엔진 초기화
     function initMqttSync() {
@@ -555,9 +565,8 @@
           console.warn("MQTT error on", brokerUrl, err);
           badge.className = 'px-2 py-0.5 text-[10px] sm:text-xs font-semibold rounded-full border border-amber-500/40 bg-amber-500/10 text-amber-400 flex items-center gap-1 cursor-pointer';
           text.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span> 대체 서버 연결중...';
-          // 보조 브로커로 자동 전환
-          currentBrokerIdx = (currentBrokerIdx + 1) % MQTT_BROKERS.length;
-          setTimeout(initMqttSync, 2000);
+          // 중복 루프 방지하며 보조 브로커 전환
+          scheduleBrokerFailover();
         });
 
         mqttClient.on('offline', () => {
@@ -701,32 +710,41 @@
       }, 2500);
     }
 
-    // 2. 스마트폰 로컬스토리지 영구 보존 (타임스탬프, 원복 내역 포함)
+    // 2. 스마트폰 및 PC 로컬스토리지 영구 보존 (업데이트 시 기존 외움 기록 100% 유지)
     function loadSavedState() {
       try {
-        const savedDeleted = localStorage.getItem('energy_exam_deleted_ids');
+        // 기존 사용자가 저장해둔 '외웠어요' 목록을 최우선으로 안전 복원
         const savedDeleted = localStorage.getItem('energy_exam_deleted_ids');
         if (savedDeleted) {
-          state.deletedIds = new Set(JSON.parse(savedDeleted));
-        } else {
-          // 초기 로컬 스토리지 비어있을 때 기본 21개 외움 세트 즉시 적용
-          state.deletedIds = new Set(DEFAULT_MASTERED_IDS);
-        }
-        // 원복 목록에 없는 기본 외움 항목 안전 반영
-        for (const id of DEFAULT_MASTERED_IDS) {
-          if (!state.restoredIds.has(id)) {
-            state.deletedIds.add(id);
+          const parsed = JSON.parse(savedDeleted);
+          if (Array.isArray(parsed)) {
+            state.deletedIds = new Set(parsed);
           }
+        } else {
+          // 로컬 저장소 기록이 전혀 없는 최초 실행 시에만 기본 세트(21개) 적용
+          state.deletedIds = new Set(DEFAULT_MASTERED_IDS);
+          try {
+            localStorage.setItem('energy_exam_deleted_ids', JSON.stringify([...state.deletedIds]));
+          } catch (e) {}
         }
 
         const savedStarred = localStorage.getItem('energy_exam_starred_ids');
-        if (savedStarred) state.starredIds = new Set(JSON.parse(savedStarred));
+        if (savedStarred) {
+          const parsedStarred = JSON.parse(savedStarred);
+          if (Array.isArray(parsedStarred)) state.starredIds = new Set(parsedStarred);
+        }
 
         const savedRestored = localStorage.getItem('energy_exam_restored_ids');
-        if (savedRestored) state.restoredIds = new Set(JSON.parse(savedRestored));
+        if (savedRestored) {
+          const parsedRestored = JSON.parse(savedRestored);
+          if (Array.isArray(parsedRestored)) state.restoredIds = new Set(parsedRestored);
+        }
 
         const savedUnstarred = localStorage.getItem('energy_exam_unstarred_ids');
-        if (savedUnstarred) state.unstarredIds = new Set(JSON.parse(savedUnstarred));
+        if (savedUnstarred) {
+          const parsedUnstarred = JSON.parse(savedUnstarred);
+          if (Array.isArray(parsedUnstarred)) state.unstarredIds = new Set(parsedUnstarred);
+        }
 
         const savedUpdatedAt = localStorage.getItem('energy_exam_last_updated_at');
         if (savedUpdatedAt) state.lastUpdatedAt = parseInt(savedUpdatedAt, 10) || 0;
@@ -736,6 +754,7 @@
       } catch (e) {
         console.error("Storage load error:", e);
       }
+      updateDashboardStats();
     }
 
     function saveLocalOnly() {
@@ -1508,12 +1527,30 @@
       }
     });
 
-    // 앱 시작 시 로드 및 MQTT 연결
-    window.addEventListener('DOMContentLoaded', () => {
-      loadSavedState();
-      updateActiveCards(false);
-      initMqttSync();
-    });
+    // 앱 시작 즉각 실행 및 DOM 안전 대기 (화면 멈춤 완전 방지)
+    function initApp() {
+      try {
+        loadSavedState();
+      } catch (e) {
+        console.error("loadSavedState error:", e);
+      }
+      try {
+        updateActiveCards(false);
+      } catch (e) {
+        console.error("updateActiveCards error:", e);
+      }
+      try {
+        initMqttSync();
+      } catch (e) {
+        console.error("initMqttSync error:", e);
+      }
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initApp);
+    } else {
+      initApp();
+    }
   </script>
 </body>
 </html>
